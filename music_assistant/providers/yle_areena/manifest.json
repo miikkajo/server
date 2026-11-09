@@ -1,0 +1,13 @@
+{
+  "type": "music",
+  "domain": "yle_areena",
+  "name": "Yle Areena",
+  "stage": "beta",
+  "description": "Listen to podcasts from Yle Areena, the Finnish public broadcaster.",
+  "documentation": "https://music-assistant.io/music-providers/yle-areena/",
+  "requirements": [],
+  "multi_instance": false,
+  "codeowners": ["@music-assistant"],
+  "tier": "community",
+  "icon": "podcast"
+}

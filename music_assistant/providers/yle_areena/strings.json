@@ -1,0 +1,20 @@
+{
+  "config_entries": {
+    "language": {
+      "label": "Content language",
+      "description": "Language of the Yle Areena podcast catalog to browse and search.",
+      "options": {
+        "fi": "Finnish",
+        "sv": "Swedish"
+      }
+    }
+  },
+  "media": {
+    "folder": {
+      "load_more": { "name": "Load more" }
+    }
+  },
+  "manifest": {
+    "description": "Listen to podcasts from Yle Areena, the Finnish public broadcaster."
+  }
+}
