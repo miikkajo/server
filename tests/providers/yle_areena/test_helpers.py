@@ -12,14 +12,18 @@ from music_assistant.providers.yle_areena.helpers import (
     decode_token_source,
     image_url,
     is_episode_only_row,
+    is_program_id,
     is_series_id,
     is_video_card,
     is_video_title,
     parse_cards,
     parse_category_controls,
+    parse_country_code,
     parse_credentials,
+    parse_episode_without_enclosure,
     parse_iso_duration,
     parse_package_rows,
+    parse_preview,
     podcast_page_url,
     series_feed_url,
 )
@@ -352,3 +356,110 @@ def test_parse_cards_and_count() -> None:
     assert cards[0].title == "Uutispodcast"
     assert content_page_count(payload) == 81
     assert content_page_count({"data": []}) == 0
+
+
+def test_is_program_id() -> None:
+    """Only Areena programme ids are accepted as episode guids."""
+    assert is_program_id("1-78654427")
+    assert not is_program_id("57-DDRw1lBwg")
+    assert not is_program_id("")
+
+
+def test_parse_preview() -> None:
+    """The player preview response is turned into the playback details."""
+    payload = {
+        "data": {
+            "ongoing_ondemand": {
+                "media_url": "https://example.com/audio.mp3?hdnts=token",
+                "region": "Finland",
+                "is_content_protected": False,
+                "duration": {"duration_in_seconds": 3198},
+                "title": {"fin": "Koneälyä"},
+                "description": {"fin": "Kuvaus"},
+                "image": {"id": "13-1-3262577-1705054534216", "version": "1792568895"},
+            }
+        }
+    }
+    preview = parse_preview(payload, "fi")
+    assert preview is not None
+    assert preview.stream_url == "https://example.com/audio.mp3?hdnts=token"
+    assert preview.region == "Finland"
+    assert not preview.is_content_protected
+    assert preview.duration == 3198
+    assert preview.title == "Koneälyä"
+    assert preview.description == "Kuvaus"
+    assert preview.image_url is not None
+
+
+def test_parse_preview_without_stream() -> None:
+    """A programme that is not available carries no stream url."""
+    assert parse_preview({"data": {}}, "fi") is None
+    assert parse_preview({"data": {"ongoing_ondemand": {}}}, "fi") is None
+    assert parse_preview({"data": {"pending_ondemand": {"media_id": "85-1"}}}, "fi") is None
+
+
+def test_parse_preview_other_language() -> None:
+    """The text of the requested language is preferred."""
+    payload = {
+        "data": {
+            "ongoing_ondemand": {
+                "media_url": "https://example.com/audio.mp3",
+                "title": {"fin": "Koneälyä", "swe": "Maskiner"},
+            }
+        }
+    }
+    preview = parse_preview(payload, "sv")
+    assert preview is not None
+    assert preview.title == "Maskiner"
+
+
+def test_parse_country_code() -> None:
+    """The country code of the geo location response is read."""
+    assert parse_country_code({"country_code": "fi"}) == "FI"
+    assert parse_country_code({"country_code": "SE"}) == "SE"
+    assert parse_country_code({}) is None
+
+
+def test_parse_episode_without_enclosure() -> None:
+    """An episode without an enclosure still becomes a podcast episode."""
+    episode = {
+        "title": "Koneälyä",
+        "guid": "1-78654427",
+        "link": "https://areena.yle.fi/1-78654427",
+        "total_time": 3198,
+        "published": 1794164400,
+        "description": "Kuvaus",
+    }
+    mass_episode = parse_episode_without_enclosure(
+        episode=episode,
+        prov_podcast_id="1-3262577",
+        position=1,
+        podcast_cover="https://example.com/cover.jpg",
+        podcast_name="Kissankehto",
+        instance_id="yle_areena",
+        domain="yle_areena",
+    )
+    assert mass_episode is not None
+    assert mass_episode.item_id == "1-3262577 1-78654427"
+    assert mass_episode.name == "Koneälyä"
+    assert mass_episode.duration == 3198
+    assert mass_episode.position == 1
+    assert mass_episode.metadata.description == "Kuvaus"
+    assert mass_episode.metadata.release_date is not None
+    # the stream url is resolved at playback time, the mapping holds the episode page
+    mapping = next(iter(mass_episode.provider_mappings))
+    assert mapping.url == "https://areena.yle.fi/1-78654427"
+
+
+def test_parse_episode_without_enclosure_invalid_guid() -> None:
+    """An episode without a usable programme id cannot be listed."""
+    assert (
+        parse_episode_without_enclosure(
+            episode={"title": "Episode", "guid": "not-an-id"},
+            prov_podcast_id="1-3262577",
+            position=1,
+            instance_id="yle_areena",
+            domain="yle_areena",
+        )
+        is None
+    )

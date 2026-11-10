@@ -76,12 +76,20 @@ from music_assistant.providers.yle_areena.constants import (
     CREDENTIALS_CACHE_TTL,
     DEFAULT_LANGUAGE,
     DOMAIN,
+    FINLAND_COUNTRY_CODE,
+    FINLAND_ONLY_REGIONS,
+    GEO_LOCATION_CACHE_TTL,
+    GEO_LOCATION_URL,
     LIBRARY_PATH,
     MAX_SEARCH_RESULTS,
     PACKAGE_VIEW_CACHE_TTL,
     PACKAGE_VIEW_PATH,
     PAGE_SIZE,
+    PLAYER_LANGUAGES,
+    PLAYER_PREVIEW_PARAMS,
+    PLAYER_PREVIEW_URL,
     PODCAST_PAGE_URLS,
+    PREVIEW_CACHE_TTL,
     SEARCH_CACHE_TTL,
     SEARCH_PATH,
     SERVICE_RADIO,
@@ -90,15 +98,20 @@ from music_assistant.providers.yle_areena.constants import (
 from music_assistant.providers.yle_areena.helpers import (
     YleCard,
     YleCredentials,
+    YlePreview,
     YleRow,
     content_page_count,
+    is_program_id,
     is_series_id,
     is_video_card,
     is_video_title,
     parse_cards,
     parse_category_controls,
+    parse_country_code,
     parse_credentials,
+    parse_episode_without_enclosure,
     parse_package_rows,
+    parse_preview,
     podcast_page_url,
     series_feed_url,
 )
@@ -292,14 +305,12 @@ class YleAreenaProvider(MusicProvider):
         episodes = parsed_feed.get("episodes", [])
         positions = get_episode_positions(episodes)
         for position, episode in zip(positions, episodes, strict=True):
-            if mass_episode := parse_podcast_episode(
+            if mass_episode := self._parse_episode(
                 episode=episode,
                 prov_podcast_id=prov_podcast_id,
                 position=position,
                 podcast_cover=podcast_cover,
                 podcast_name=parsed_feed.get("title"),
-                domain=self.domain,
-                instance_id=self.instance_id,
             ):
                 yield mass_episode
 
@@ -311,14 +322,12 @@ class YleAreenaProvider(MusicProvider):
         episodes = parsed_feed.get("episodes", [])
         positions = get_episode_positions(episodes)
         for position, episode in zip(positions, episodes, strict=True):
-            mass_episode = parse_podcast_episode(
+            mass_episode = self._parse_episode(
                 episode=episode,
                 prov_podcast_id=series_id,
                 position=position,
                 podcast_cover=podcast_cover,
                 podcast_name=parsed_feed.get("title"),
-                domain=self.domain,
-                instance_id=self.instance_id,
             )
             if mass_episode is None:
                 continue
@@ -355,8 +364,9 @@ class YleAreenaProvider(MusicProvider):
             parsed_feed=parsed_feed, guid_or_stream_url=guid_or_stream_url
         )
         if stream_url is None:
-            msg = f"No stream found for episode: {item_id}"
-            raise MediaNotFoundError(msg)
+            # the feed carries no enclosure for this episode, so the stream is
+            # resolved from the Areena player instead
+            stream_url = await self._resolve_stream_url(guid_or_stream_url)
         return StreamDetails(
             provider=self.instance_id,
             item_id=item_id,
@@ -608,6 +618,126 @@ class YleAreenaProvider(MusicProvider):
             msg = f"Invalid Yle Areena episode id: {prov_episode_id}"
             raise MediaNotFoundError(msg)
         return series_id, guid_or_stream_url
+
+    def _parse_episode(
+        self,
+        *,
+        episode: dict[str, Any],
+        prov_podcast_id: str,
+        position: int,
+        podcast_cover: str | None,
+        podcast_name: str | None,
+    ) -> PodcastEpisode | None:
+        """Turn a feed episode into a podcast episode."""
+        mass_episode = parse_podcast_episode(
+            episode=episode,
+            prov_podcast_id=prov_podcast_id,
+            position=position,
+            podcast_cover=podcast_cover,
+            podcast_name=podcast_name,
+            domain=self.domain,
+            instance_id=self.instance_id,
+        )
+        if mass_episode is not None:
+            return mass_episode
+        # Yle publishes no enclosure for a part of the catalogue, e.g. for music
+        # programmes. Those episodes are listed as well, their stream is resolved
+        # from the Areena player when the playback starts.
+        return parse_episode_without_enclosure(
+            episode=episode,
+            prov_podcast_id=prov_podcast_id,
+            position=position,
+            podcast_cover=podcast_cover,
+            podcast_name=podcast_name,
+            domain=self.domain,
+            instance_id=self.instance_id,
+        )
+
+    async def _resolve_stream_url(self, program_id: str) -> str:
+        """Resolve the stream url of an episode that the feed has no enclosure for."""
+        if not is_program_id(program_id):
+            msg = f"Invalid Yle Areena programme id: {program_id}"
+            raise MediaNotFoundError(msg)
+        preview = await self._get_preview(program_id)
+        if preview is None:
+            msg = f"No stream found for episode: {program_id}"
+            raise MediaNotFoundError(msg)
+        if preview.is_content_protected:
+            # there is no licence path for such a programme, so it is skipped
+            msg = f"Yle Areena episode {program_id} is content protected"
+            raise MediaNotFoundError(msg)
+        await self._ensure_region_allowed(preview.region)
+        return preview.stream_url
+
+    @use_cache(PREVIEW_CACHE_TTL)
+    async def _get_preview_payload(self, program_id: str, language: str) -> dict[str, Any]:
+        """Return the cached raw player preview response of an episode."""
+        params = dict(PLAYER_PREVIEW_PARAMS)
+        params["language"] = PLAYER_LANGUAGES.get(language, "fin")
+        return await self._player_api_get(PLAYER_PREVIEW_URL.format(program_id=program_id), params)
+
+    async def _get_preview(self, program_id: str) -> YlePreview | None:
+        """Return the playback details of an episode."""
+        payload = await self._get_preview_payload(program_id, self.language)
+        return parse_preview(payload, self.language)
+
+    async def _ensure_region_allowed(self, region: str | None) -> None:
+        """Refuse to stream content that Yle limits to a region this server is not in."""
+        if region not in FINLAND_ONLY_REGIONS:
+            return
+        country_code = await self._get_country_code()
+        if country_code is None:
+            # the location could not be determined, the stream itself is still
+            # refused by Yle when it is not allowed from here
+            self.logger.warning("Could not determine the country of this server")
+            return
+        if country_code != FINLAND_COUNTRY_CODE:
+            msg = (
+                "Yle Areena content is only available in Finland "
+                f"(this server is in {country_code})"
+            )
+            raise ProviderUnavailableError(msg)
+
+    @use_cache(GEO_LOCATION_CACHE_TTL)
+    async def _get_country_code(self) -> str | None:
+        """Return the country code Yle sees for this server."""
+        payload = await self._api_get(GEO_LOCATION_URL)
+        return parse_country_code(payload)
+
+    @throttle_with_retries
+    async def _player_api_get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Perform a throttled request against the Areena player API."""
+        try:
+            async with self.mass.http_session.get(
+                url, params=params, headers=BROWSER_HEADERS
+            ) as response:
+                status = response.status
+                if status == 404:
+                    msg = f"Yle Areena item not found: {url}"
+                    raise MediaNotFoundError(msg)
+                if status == 429:
+                    raise RateLimited(
+                        "Yle Areena rate limit",
+                        backoff_time=self._retry_after(response.headers.get("Retry-After")),
+                    )
+                if status >= 500:
+                    msg = f"Yle Areena API error {status}"
+                    raise ResourceTemporarilyUnavailable(msg)
+                if status != 200:
+                    msg = f"Yle Areena API error {status}"
+                    raise ProviderUnavailableError(msg)
+                try:
+                    payload = await response.json(content_type=None)
+                except ValueError as err:
+                    msg = "Invalid JSON from Yle Areena"
+                    raise ResourceTemporarilyUnavailable(msg) from err
+        except _NETWORK_ERRORS as err:
+            msg = "Unable to reach Yle Areena"
+            raise ResourceTemporarilyUnavailable(msg) from err
+        if not isinstance(payload, dict):
+            msg = "Unexpected response from Yle Areena"
+            raise ResourceTemporarilyUnavailable(msg)
+        return payload
 
     async def _get_credentials(self, force_refresh: bool = False) -> YleCredentials:
         """Return the frontend API credentials, refreshing them when stale."""

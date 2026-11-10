@@ -8,14 +8,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.enums import MediaType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
 from music_assistant_models.media_items import Podcast, ProviderMapping
 
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 from music_assistant.providers import yle_areena as yle_areena_module
 from music_assistant.providers.yle_areena import SUPPORTED_FEATURES, YleAreenaProvider
 from music_assistant.providers.yle_areena.constants import CONF_LANGUAGE, DOMAIN
-from music_assistant.providers.yle_areena.helpers import YleRow
+from music_assistant.providers.yle_areena.helpers import YlePreview, YleRow
 
 if TYPE_CHECKING:
     from music_assistant_models.media_items import BrowseFolder
@@ -281,8 +281,137 @@ async def test_get_stream_details_unknown_episode(
 ) -> None:
     """An episode that is no longer in the feed is reported as missing."""
     monkeypatch.setattr(provider, "_cache_get_podcast", AsyncMock(return_value={"episodes": []}))
+    monkeypatch.setattr(provider, "_get_preview", AsyncMock(return_value=None))
     with pytest.raises(MediaNotFoundError):
         await provider.get_stream_details("1-61894955 1-78588425", MediaType.PODCAST_EPISODE)
+
+
+async def test_get_stream_details_resolves_player_stream(
+    provider: YleAreenaProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An episode without an enclosure is streamed from the Areena player."""
+    parsed_feed = {
+        "episodes": [
+            {
+                "title": "Episode",
+                "guid": "1-78588425",
+                "enclosures": [],
+            }
+        ]
+    }
+    monkeypatch.setattr(provider, "_cache_get_podcast", AsyncMock(return_value=parsed_feed))
+    monkeypatch.setattr(
+        provider,
+        "_get_preview",
+        AsyncMock(
+            return_value=YlePreview(
+                stream_url="https://example.com/episode.mp3",
+                region="Finland",
+                is_content_protected=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(provider, "_get_country_code", AsyncMock(return_value="FI"))
+    details = await provider.get_stream_details("1-61894955 1-78588425", MediaType.PODCAST_EPISODE)
+    assert details.path == "https://example.com/episode.mp3"
+
+
+async def test_get_stream_details_skips_content_protected(
+    provider: YleAreenaProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A protected programme has no licence path and is not played."""
+    monkeypatch.setattr(
+        provider,
+        "_cache_get_podcast",
+        AsyncMock(return_value={"episodes": [{"guid": "1-78588425"}]}),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_preview",
+        AsyncMock(
+            return_value=YlePreview(
+                stream_url="https://example.com/episode.mp3",
+                region="Finland",
+                is_content_protected=True,
+            )
+        ),
+    )
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_stream_details("1-61894955 1-78588425", MediaType.PODCAST_EPISODE)
+
+
+async def test_get_stream_details_refuses_other_region(
+    provider: YleAreenaProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content that Yle limits to Finland is not streamed from another country."""
+    monkeypatch.setattr(
+        provider,
+        "_cache_get_podcast",
+        AsyncMock(return_value={"episodes": [{"guid": "1-78588425"}]}),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_preview",
+        AsyncMock(
+            return_value=YlePreview(
+                stream_url="https://example.com/episode.mp3",
+                region="Finland",
+                is_content_protected=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(provider, "_get_country_code", AsyncMock(return_value="SE"))
+    with pytest.raises(ProviderUnavailableError):
+        await provider.get_stream_details("1-61894955 1-78588425", MediaType.PODCAST_EPISODE)
+
+
+async def test_get_podcast_episodes_lists_episode_without_enclosure(
+    provider: YleAreenaProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An episode that Yle publishes without an enclosure is listed as well."""
+    parsed_feed = {
+        "title": "Uutispodcast",
+        "episodes": [
+            {
+                "title": "Koneälyä",
+                "guid": "1-78654427",
+                "link": "https://areena.yle.fi/1-78654427",
+                "total_time": 3198,
+                "published": 1794164400,
+                "description": "Kuvaus",
+                "enclosures": [],
+            }
+        ],
+    }
+    monkeypatch.setattr(provider, "_cache_get_podcast", AsyncMock(return_value=parsed_feed))
+    episodes = [episode async for episode in provider.get_podcast_episodes("1-61894955")]
+    assert len(episodes) == 1
+    assert episodes[0].item_id == "1-61894955 1-78654427"
+    assert episodes[0].name == "Koneälyä"
+    assert episodes[0].duration == 3198
+    assert episodes[0].metadata.description == "Kuvaus"
+
+
+async def test_get_podcast_episode_returns_episode_without_enclosure(
+    provider: YleAreenaProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An episode without an enclosure can be fetched by its id."""
+    parsed_feed = {
+        "title": "Uutispodcast",
+        "episodes": [
+            {
+                "title": "Koneälyä",
+                "guid": "1-78654427",
+                "link": "https://areena.yle.fi/1-78654427",
+                "total_time": 3198,
+                "enclosures": [],
+            }
+        ],
+    }
+    monkeypatch.setattr(provider, "_cache_get_podcast", AsyncMock(return_value=parsed_feed))
+    episode = await provider.get_podcast_episode("1-61894955 1-78654427")
+    assert episode.item_id == "1-61894955 1-78654427"
+    assert episode.name == "Koneälyä"
 
 
 @pytest.mark.parametrize(
