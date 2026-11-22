@@ -38,6 +38,7 @@ def _controller(current_index: int = 0) -> Any:
     ctrl = PlayerQueuesController.__new__(PlayerQueuesController)
     ctrl.logger = Mock()
     ctrl.mass = MagicMock()
+    ctrl.mass.players.get_player.return_value.offline_by_power_control = False
     ctrl.signal_update = Mock()  # type: ignore[method-assign]
     ctrl._enqueue_next_item = Mock()  # type: ignore[method-assign]
     queue = PlayerQueue(queue_id="q1", active=True, display_name="Q1", available=True, items=0)
@@ -58,7 +59,6 @@ async def test_a_new_load_drops_what_the_old_one_fetched() -> None:
     data = ctrl._queue_data["q1"]
     data.last_served_item_id = data.items[2].queue_item_id
     ctrl._preload_next_item = Mock()
-    ctrl._cleanup_stale_queue_buffers = Mock()
     ctrl._load_item = AsyncMock()
     ctrl._check_player_permission = Mock()
     ctrl._set_transitioning = Mock()

@@ -87,6 +87,27 @@ async def test_overwrite_update_replaces_artists(mass: MusicAssistant) -> None:
     assert [artist.name for artist in refreshed.artists] == ["Other Artist"]
 
 
+async def test_overwrite_update_keeps_artists_when_lookup_fails(mass: MusicAssistant) -> None:
+    """A failing artist lookup during an overwrite update must not clear the stored artists."""
+    db_album = await mass.music.albums.add_item_to_library(create_album("spotify_1", "album1"))
+
+    update = create_album(
+        "spotify_1", "album1", artist_name="Other Artist", artist_item_id="other_artist"
+    )
+    with (
+        patch.object(
+            mass.music.artists,
+            "get_or_add_library_artist_id",
+            AsyncMock(side_effect=MediaNotFoundError("lookup failed")),
+        ),
+        pytest.raises(MediaNotFoundError),
+    ):
+        await mass.music.albums.update_item_in_library(db_album.item_id, update, overwrite=True)
+
+    refreshed = await mass.music.albums.get_library_item(db_album.item_id)
+    assert [artist.name for artist in refreshed.artists] == ["Test Artist"]
+
+
 async def test_track_overwrite_keeps_album_artists(mass: MusicAssistant) -> None:
     """A track update carrying an artist-less album must not clear that album's artists."""
     db_album = await mass.music.albums.add_item_to_library(create_album("spotify_1", "album1"))
@@ -534,6 +555,62 @@ async def test_album_tracks_of_an_unavailable_provider_are_not_kept(mass: MusicA
     ):
         tracks = await mass.music.albums.tracks("album_x", "qobuz_1")
     assert [track.item_id for track in tracks] == ["t1"]
+
+
+async def test_provider_album_tracks_carry_the_album_held(mass: MusicAssistant) -> None:
+    """Tracks listed without their album get the album held already, without a new lookup."""
+    fetch = AsyncMock(return_value=[create_track("spotify_1", "t1")])
+    lookup = AsyncMock()
+    with (
+        patch.object(
+            mass,
+            "get_provider",
+            return_value=SimpleNamespace(
+                instance_id="spotify_1", available=True, get_album_tracks=fetch
+            ),
+        ),
+        patch.object(mass.music.albums, "get_provider_item", lookup),
+    ):
+        tracks = await mass.music.albums.provider_album_tracks(_detailed_album())
+    lookup.assert_not_awaited()
+    assert isinstance(tracks[0].album, ItemMapping)
+    assert tracks[0].album.item_id == "album1"
+    assert tracks[0].image is not None
+    assert tracks[0].image.path == ALBUM_IMAGE
+
+
+async def test_provider_album_tracks_look_up_an_album_without_image(mass: MusicAssistant) -> None:
+    """An album held without the image its tracks lack is looked up for it after all."""
+    fetch = AsyncMock(return_value=[create_track("spotify_1", "t1")])
+    lookup = AsyncMock(return_value=_detailed_album())
+    held = create_album("spotify_1", "album1")
+    with (
+        patch.object(
+            mass,
+            "get_provider",
+            return_value=SimpleNamespace(
+                instance_id="spotify_1", available=True, get_album_tracks=fetch
+            ),
+        ),
+        patch.object(mass.music.albums, "get_provider_item", lookup),
+    ):
+        tracks = await mass.music.albums.provider_album_tracks(held)
+    lookup.assert_awaited_once_with("album1", "spotify_1", strict_provider_instance=True)
+    assert tracks[0].image is not None
+    assert tracks[0].image.path == ALBUM_IMAGE
+
+
+async def test_provider_album_tracks_of_a_library_album_come_from_the_library(
+    mass: MusicAssistant,
+) -> None:
+    """A provider album that is in the library lists the tracks of the library album."""
+    library_album = await mass.music.albums.add_item_to_library(_detailed_album())
+    fetch = AsyncMock(return_value=[create_track("spotify_1", "t1")])
+    with patch.object(mass.music.albums, "_get_provider_album_tracks", fetch):
+        tracks = await mass.music.albums.provider_album_tracks(_detailed_album())
+    assert [track.item_id for track in tracks] == ["t1"]
+    assert isinstance(tracks[0].album, ItemMapping)
+    assert tracks[0].album.item_id == library_album.item_id
 
 
 async def test_album_tracks_of_a_source_not_loaded_are_assembled_again(
